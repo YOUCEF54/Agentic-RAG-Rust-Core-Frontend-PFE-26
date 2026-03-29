@@ -86,10 +86,10 @@ export const useAgentChat = () => {
         message: content
       });
 
-      const nextMessages = [
+      const nextMessages: ChatMessage[] = [
         ...messages,
         { role: 'user', content },
-        { role: 'agent', content: response.data.response }
+        { role: 'agent', content: String(response.data?.response ?? '') }
       ];
       setMessages(nextMessages);
       await persistMessages(nextMessages);

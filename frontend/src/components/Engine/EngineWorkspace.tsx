@@ -22,6 +22,9 @@ interface IndexStatusInfo {
   last_build_ms?: number;
   pages?: number;
   chunks?: number;
+  chunking?: string;
+  embed_batch_size?: number;
+  hardware_config_mtime?: number | null;
   last_error?: string | null;
 }
 
@@ -29,6 +32,49 @@ interface IndexStatus {
   status: string;
   ready: boolean;
   info?: IndexStatusInfo;
+}
+
+interface HardwareCalibrationSummary {
+  optimal_batch_size?: number;
+  throughput_measured?: number;
+  calibration_date?: string;
+  cpu_info?: string;
+  tested_batch_sizes?: number[];
+  stop_reason?: string;
+}
+
+interface IndexBuildRequest {
+  rebuild: boolean;
+  max_pages: number | null;
+  run_hardware_test?: boolean;
+  save_hardware_config?: boolean;
+  hardware_quick_test?: boolean;
+  hardware_max_runtime_seconds?: number;
+}
+
+interface IndexBuildResponse {
+  status?: string;
+  ready?: boolean;
+  info?: IndexStatusInfo;
+  chunking?: string;
+  embed_batch_size?: number;
+  hardware_config_mtime?: number | null;
+  hardware_calibration?: HardwareCalibrationSummary;
+}
+
+interface HardwareConfigResponse {
+  active_embed_batch_size?: number;
+  embed_batch_size?: number;
+  config_path?: string;
+  hardware_config_mtime?: number | null;
+  config?: HardwareCalibrationSummary | Record<string, unknown> | null;
+  hardware_config?: HardwareCalibrationSummary | Record<string, unknown> | null;
+}
+
+interface HealthStatus {
+  chunking?: string;
+  embed_batch_size?: number;
+  hardware_config_mtime?: number | null;
 }
 
 interface RetrievedChunk {
@@ -71,6 +117,22 @@ interface EngineChatMessage {
 const MAX_TRACE_FIELDS = 4;
 const MAX_SOURCE_CHUNKS = 6;
 
+const AGENT_STEPS = [
+  { key: 'QueryRefiner', label: 'Refining' },
+  { key: 'Retriever', label: 'Searching' },
+  { key: 'Selector', label: 'Filtering' },
+  { key: 'Generator', label: 'Drafting' },
+  { key: 'Evaluator', label: 'Verifying' }
+];
+
+const getActiveStepIndex = (message: EngineChatMessage) => {
+  if (message.status === 'done') return AGENT_STEPS.length;
+  if (!message.trace || message.trace.length === 0) return 0;
+  const lastTrace = message.trace[message.trace.length - 1];
+  const stepIndex = AGENT_STEPS.findIndex(step => step.key === lastTrace.agent);
+  return stepIndex !== -1 ? stepIndex : 0;
+};
+
 const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
   const [documents, setDocuments] = useState<EngineDocument[]>([]);
   const [isLoadingDocs, setIsLoadingDocs] = useState(true);
@@ -80,12 +142,21 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
   const [isUploading, setIsUploading] = useState(false);
 
   const [autoRebuild, setAutoRebuild] = useState(true);
-  const [needsReindex, setNeedsReindex] = useState(false);
+  const [localPendingReindex, setLocalPendingReindex] = useState(false);
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [isIndexing, setIsIndexing] = useState(false);
   const [indexError, setIndexError] = useState<string | null>(null);
   const [rebuildFromScratch, setRebuildFromScratch] = useState(true);
   const [maxPages, setMaxPages] = useState('');
+  const [runHardwareTest, setRunHardwareTest] = useState(false);
+  const [saveHardwareConfig, setSaveHardwareConfig] = useState(true);
+  const [hardwareQuickTest, setHardwareQuickTest] = useState(true);
+  const [latestIndexBuild, setLatestIndexBuild] = useState<IndexBuildResponse | null>(null);
+  const [hardwareConfig, setHardwareConfig] = useState<HardwareConfigResponse | null>(null);
+  const [healthStatus, setHealthStatus] = useState<HealthStatus | null>(null);
+  const [lastCalibration, setLastCalibration] = useState<HardwareCalibrationSummary | null>(null);
+  const [isCalibrating, setIsCalibrating] = useState(false);
+  const [hardwareError, setHardwareError] = useState<string | null>(null);
 
   const [messages, setMessages] = useState<EngineChatMessage[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -95,8 +166,6 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
   const [minScore, setMinScore] = useState(0.7);
   const [maxAttempts, setMaxAttempts] = useState(3);
   const [mode, setMode] = useState<'agentic' | 'naive' | 'retrieval_only'>('agentic');
-  const [useLlm, setUseLlm] = useState(true);
-  const [chatModel, setChatModel] = useState('openrouter/free');
   const [isQuerying, setIsQuerying] = useState(false);
   const [streamState, setStreamState] = useState('idle');
   const [queryError, setQueryError] = useState<string | null>(null);
@@ -129,25 +198,49 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
       const response = await engineApi.get('/index/status');
       const payload = response.data as IndexStatus;
       setIndexStatus(payload);
-      if (payload.ready === false) {
-        setNeedsReindex(true);
-      }
+      setIndexError(null);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unable to load index status.';
       setIndexError(message);
     }
   };
 
+  const loadHardwareConfig = async () => {
+    try {
+      const response = await engineApi.get('/hardware/config');
+      const payload = response.data as HardwareConfigResponse;
+      setHardwareConfig(payload);
+      const configCalibration = normalizeCalibration(payload.config || payload.hardware_config);
+      if (configCalibration) {
+        setLastCalibration(configCalibration);
+      }
+      setHardwareError(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to load hardware config.';
+      setHardwareError(message);
+    }
+  };
+
+  const loadHealthStatus = async () => {
+    try {
+      const response = await engineApi.get('/health');
+      const payload = response.data as HealthStatus;
+      setHealthStatus(payload);
+    } catch {
+      // Health diagnostics are optional in UI; ignore endpoint failures.
+    }
+  };
+
   useEffect(() => {
     loadDocuments();
     loadIndexStatus();
+    loadHardwareConfig();
+    loadHealthStatus();
     const timer = window.setInterval(loadIndexStatus, 20000);
     return () => window.clearInterval(timer);
   }, []);
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isQuerying]);
+
 
   const createId = () => `run-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
@@ -182,6 +275,43 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
       dateStyle: 'medium',
       timeStyle: 'short'
     }).format(date);
+  };
+
+  const formatMtime = (value?: number | null) => {
+    if (typeof value !== 'number' || Number.isNaN(value)) {
+      return '-';
+    }
+    const milliseconds = value > 1_000_000_000_000 ? value : value * 1000;
+    return formatDate(new Date(milliseconds).toISOString());
+  };
+
+  const normalizeCalibration = (value: unknown): HardwareCalibrationSummary | null => {
+    if (!value || typeof value !== 'object') {
+      return null;
+    }
+    const record = value as Record<string, unknown>;
+    const calibration: HardwareCalibrationSummary = {};
+    if (typeof record.optimal_batch_size === 'number') {
+      calibration.optimal_batch_size = record.optimal_batch_size;
+    }
+    if (typeof record.throughput_measured === 'number') {
+      calibration.throughput_measured = record.throughput_measured;
+    }
+    if (typeof record.calibration_date === 'string') {
+      calibration.calibration_date = record.calibration_date;
+    }
+    if (typeof record.cpu_info === 'string') {
+      calibration.cpu_info = record.cpu_info;
+    }
+    if (Array.isArray(record.tested_batch_sizes)) {
+      calibration.tested_batch_sizes = record.tested_batch_sizes.filter(
+        (value): value is number => typeof value === 'number'
+      );
+    }
+    if (typeof record.stop_reason === 'string') {
+      calibration.stop_reason = record.stop_reason;
+    }
+    return Object.keys(calibration).length ? calibration : null;
   };
 
   const formatTraceValue = (value: unknown) => {
@@ -239,7 +369,7 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
         if (autoRebuild) {
           await handleIndex();
         } else {
-          setNeedsReindex(true);
+          setLocalPendingReindex(true);
         }
       }
     } catch (err) {
@@ -264,7 +394,7 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
       if (autoRebuild) {
         await loadIndexStatus();
       } else {
-        setNeedsReindex(true);
+        setLocalPendingReindex(true);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to delete document.';
@@ -276,18 +406,66 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
     try {
       setIsIndexing(true);
       setIndexError(null);
-      const payload = {
+      const payload: IndexBuildRequest = {
         rebuild: rebuildFromScratch,
-        max_pages: maxPages.trim() ? Number(maxPages) : null
+        max_pages: maxPages.trim() ? Number(maxPages) : null,
+        run_hardware_test: runHardwareTest,
+        save_hardware_config: saveHardwareConfig,
+        hardware_quick_test: hardwareQuickTest,
+        hardware_max_runtime_seconds: 25
       };
-      await engineApi.post('/index', payload);
+      const response = await engineApi.post('/index', payload);
+      const result = response.data as IndexBuildResponse;
+      setLatestIndexBuild(result);
+      if (result.hardware_calibration) {
+        setLastCalibration(result.hardware_calibration);
+      }
       await loadIndexStatus();
-      setNeedsReindex(false);
+      await loadHardwareConfig();
+      await loadHealthStatus();
+      setLocalPendingReindex(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to run indexing.';
       setIndexError(message);
     } finally {
       setIsIndexing(false);
+    }
+  };
+
+  const handleCalibrateNow = async () => {
+    try {
+      setIsCalibrating(true);
+      setHardwareError(null);
+      const response = await engineApi.post('/hardware/calibrate', {
+        save_config: saveHardwareConfig,
+        quick_mode: hardwareQuickTest,
+        max_runtime_seconds: 25
+      });
+      const payload = response.data as Record<string, unknown>;
+      const directCalibration = normalizeCalibration(payload);
+      const nestedCalibration =
+        normalizeCalibration(payload.hardware_calibration) || normalizeCalibration(payload.config);
+      const calibration = directCalibration || nestedCalibration;
+      if (calibration) {
+        setLastCalibration(calibration);
+      }
+      if (typeof payload.embed_batch_size === 'number' || typeof payload.active_embed_batch_size === 'number') {
+        setLatestIndexBuild((prev) => ({
+          ...(prev || {}),
+          embed_batch_size:
+            typeof payload.embed_batch_size === 'number'
+              ? payload.embed_batch_size
+              : (payload.active_embed_batch_size as number)
+        }));
+      }
+      await loadHardwareConfig();
+      await loadIndexStatus();
+      await loadHealthStatus();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to run hardware calibration.';
+      setHardwareError(message);
+    } finally {
+      setIsCalibrating(false);
     }
   };
   const handleStreamEvent = (
@@ -302,7 +480,14 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
     }
 
     if (event === 'trace') {
-      const nextTrace = payload as TraceEvent;
+      const nextTrace: TraceEvent = {
+        agent: typeof payload.agent === 'string' ? payload.agent : 'agent',
+        message: typeof payload.message === 'string' ? payload.message : '',
+        data:
+          payload.data && typeof payload.data === 'object'
+            ? (payload.data as Record<string, unknown>)
+            : undefined
+      };
       updateMessage(runId, (message) => ({
         ...message,
         trace: [...(message.trace || []), nextTrace],
@@ -438,7 +623,11 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
       return;
     }
     if (needsReindex) {
-      setQueryError('Index needs rebuilding before querying.');
+      setQueryError(
+        localPendingReindex
+          ? 'Documents changed since the last build. Rebuild the index before querying.'
+          : 'Index is still building. Wait until it is ready before querying.'
+      );
       return;
     }
     const runId = createId();
@@ -467,12 +656,9 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
     setIsQuerying(true);
     setStreamState('starting');
 
-    const effectiveUseLlm = mode === 'retrieval_only' ? false : useLlm;
     const payload = {
       question: trimmedQuestion,
       top_k: topK,
-      chat_model: chatModel.trim(),
-      use_llm: effectiveUseLlm,
       mode,
       return_trace: true,
       min_score: minScore,
@@ -543,6 +729,34 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
   const traceItems = selectedRun?.trace || [];
   const retrievedItems = (selectedRun?.retrieved || []).slice(0, MAX_SOURCE_CHUNKS);
   const showTraceEmpty = !traceItems.length && !isQuerying;
+  const needsReindex = localPendingReindex || indexStatus?.ready === false;
+  const indexUiState =
+    indexStatus?.ready === true ? (localPendingReindex ? 'stale' : 'ready') : 'pending';
+  const indexHeaderLabel =
+    indexUiState === 'ready'
+      ? 'Index Ready'
+      : indexUiState === 'stale'
+        ? 'Index Stale'
+        : 'Index Pending';
+  const indexPanelLabel =
+    indexUiState === 'ready' ? 'Ready' : indexUiState === 'stale' ? 'Stale' : 'Needs build';
+  const chunkingMode =
+    indexStatus?.info?.chunking || latestIndexBuild?.chunking || healthStatus?.chunking || '-';
+  const activeEmbedBatchSize =
+    indexStatus?.info?.embed_batch_size ??
+    latestIndexBuild?.embed_batch_size ??
+    healthStatus?.embed_batch_size ??
+    hardwareConfig?.active_embed_batch_size ??
+    hardwareConfig?.embed_batch_size;
+  const hardwareConfigMtime =
+    indexStatus?.info?.hardware_config_mtime ??
+    latestIndexBuild?.hardware_config_mtime ??
+    healthStatus?.hardware_config_mtime ??
+    hardwareConfig?.hardware_config_mtime ??
+    null;
+  const storedCalibration = normalizeCalibration(hardwareConfig?.config || hardwareConfig?.hardware_config);
+  const calibrationSummary =
+    latestIndexBuild?.hardware_calibration || lastCalibration || storedCalibration;
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop: (acceptedFiles) => {
@@ -558,12 +772,21 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
       <header className="engine-header">
         <div>
           <p className="engine-eyebrow">Agentic RAG Console</p>
-          <h1>Query, trace, and refine answers in real time.</h1>
+          {/* <h1>Query, trace, and refine answers in real time.</h1> */}
+          <h1>PFE 2026</h1>
         </div>
         <div className="engine-header-actions">
           <div className="engine-status-pill">
-            <span className={indexStatus?.ready ? 'status-ready' : 'status-pending'} />
-            {indexStatus?.ready ? 'Index Ready' : 'Index Pending'}
+            <span
+              className={
+                indexUiState === 'ready'
+                  ? 'status-ready'
+                  : indexUiState === 'stale'
+                    ? 'status-stale'
+                    : 'status-pending'
+              }
+            />
+            {indexHeaderLabel}
           </div>
           <Button className="ghost-button" onClick={onBack}>
             Back to Router
@@ -572,254 +795,70 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
       </header>
 
       <div className="engine-body">
-        <section className="engine-chat-panel">
-          <div className="engine-chat-header">
-            <div>
-              <h2>Agent Chat</h2>
-              <p>
-                {streamState === 'starting'
-                  ? 'Connecting to the engine...'
-                  : 'Ask a question and watch the agent pipeline run.'}
-              </p>
-            </div>
-            <div className="engine-chat-status">
-              <span className="engine-live">Live</span>
-              <span className="engine-stream">{isQuerying ? 'Streaming' : 'Idle'}</span>
-            </div>
-          </div>
-
-          <div className="engine-message-list">
-            {messages.length ? (
-              messages.map((message) => (
-                <button
-                  key={message.id}
-                  type="button"
-                  className={`engine-message ${message.role} ${
-                    message.id === selectedRunId ? 'selected' : ''
-                  }`}
-                  onClick={() => {
-                    if (message.role === 'assistant') {
-                      setSelectedRunId(message.id);
-                    }
-                  }}
-                >
-                  <div className="engine-message-bubble">
-                    {message.role === 'assistant' ? (
-                      <>
-                        <div className="engine-message-meta">
-                          <span className="engine-role">Agent</span>
-                          {message.status === 'streaming' ? (
-                            <span className="engine-tag">Thinking...</span>
-                          ) : null}
-                          {message.modelUsed ? (
-                            <span className="engine-tag">Model: {message.modelUsed}</span>
-                          ) : null}
-                          {message.models
-                            ? Object.entries(message.models).map(([key, value]) => (
-                                <span key={`${message.id}-${key}`} className="engine-tag">
-                                  {key}: {value}
-                                </span>
-                              ))
-                            : null}
-                        </div>
-                        {message.content ? (
-                          <ReactMarkdown>{message.content}</ReactMarkdown>
-                        ) : (
-                          <p className="engine-placeholder">Agent is gathering context...</p>
-                        )}
-                      </>
-                    ) : (
-                      <p>{message.content}</p>
-                    )}
-                  </div>
-                </button>
-              ))
-            ) : (
-              <div className="engine-empty">
-                <p>No chats yet. Ask your first question to get started.</p>
-              </div>
-            )}
-            {isQuerying ? (
-              <div className="engine-message assistant">
-                <div className="engine-message-bubble">
-                  <div className="typing-indicator">
-                    <span>Agent is thinking</span>
-                    <span className="typing-dot" />
-                    <span className="typing-dot" />
-                    <span className="typing-dot" />
-                  </div>
-                </div>
-              </div>
-            ) : null}
-            <div ref={endRef} />
-          </div>
-
-          <div className="engine-composer">
-            {needsReindex ? (
-              <div className="engine-alert">
-                Index needs rebuilding before you can query.{' '}
-                <button type="button" onClick={handleIndex} disabled={isIndexing}>
-                  {isIndexing ? 'Rebuilding...' : 'Rebuild now'}
-                </button>
-              </div>
-            ) : null}
-            <textarea
-              className="engine-textarea"
-              placeholder="Ask about your PDFs, policies, or notes..."
-              value={question}
-              onChange={(event) => setQuestion(event.target.value)}
-            />
-            <div className="engine-composer-row">
-              <div className="engine-composer-left">
-                <label className="engine-switch">
-                  <input
-                    type="checkbox"
-                    checked={useLlm}
-                    onChange={(event) => setUseLlm(event.target.checked)}
-                  />
-                  Use LLM
-                </label>
-                <label className="engine-field">
-                  Top K
-                  <input
-                    type="number"
-                    min={1}
-                    max={10}
-                    value={topK}
-                    onChange={(event) => setTopK(Number(event.target.value))}
-                  />
-                </label>
-                <label className="engine-field">
-                  Min score
-                  <input
-                    type="number"
-                    step={0.05}
-                    min={0}
-                    max={1}
-                    value={minScore}
-                    onChange={(event) => setMinScore(Number(event.target.value))}
-                  />
-                </label>
-                <label className="engine-field">
-                  Max attempts
-                  <input
-                    type="number"
-                    min={1}
-                    max={6}
-                    value={maxAttempts}
-                    onChange={(event) => setMaxAttempts(Number(event.target.value))}
-                  />
-                </label>
-                <label className="engine-field">
-                  Mode
-                  <select value={mode} onChange={(event) => setMode(event.target.value as typeof mode)}>
-                    <option value="agentic">Agentic</option>
-                    <option value="naive">Naive</option>
-                    <option value="retrieval_only">Retrieval only</option>
-                  </select>
-                </label>
-                <label className="engine-field">
-                  Model
-                  <input
-                    type="text"
-                    value={chatModel}
-                    onChange={(event) => setChatModel(event.target.value)}
-                  />
-                </label>
-              </div>
-              <Button onClick={handleQuery} disabled={!canSend}>
-                {isQuerying ? 'Running...' : 'Send'}
-              </Button>
-            </div>
-            {queryError ? <p className="error-banner">{queryError}</p> : null}
-          </div>
-
-          <div className="engine-insights-grid">
-            <div className="engine-panel">
-              <div className="engine-panel-header">
-                <h3>Agent Trace</h3>
-                {selectedRun?.modelUsed ? (
-                  <span className="engine-tag">Generator: {selectedRun.modelUsed}</span>
-                ) : null}
-              </div>
-              <div className="engine-panel-body">
-                {showTraceEmpty ? (
-                  <div className="engine-empty">
-                    <p>Trace events will appear here during execution.</p>
-                  </div>
-                ) : (
-                  <div className="engine-trace-list">
-                    {traceItems.map((trace, index) => (
-                      <div key={`${trace.agent}-${index}`} className="engine-trace-item">
-                        <div className="engine-trace-header">
-                          <span className="engine-trace-agent">{trace.agent}</span>
-                          {selectedRun?.models
-                            ? Object.entries(selectedRun.models)
-                                .filter(([key]) => trace.agent.toLowerCase().includes(key))
-                                .map(([key, value]) => (
-                                  <span key={`${trace.agent}-${key}`} className="engine-tag">
-                                    {value}
-                                  </span>
-                                ))
-                            : null}
-                        </div>
-                        <p className="engine-trace-message">{trace.message}</p>
-                        {trace.data ? (
-                          <ul className="engine-trace-data">
-                            {Object.entries(trace.data)
-                              .slice(0, MAX_TRACE_FIELDS)
-                              .map(([key, value]) => (
-                                <li key={`${trace.agent}-${key}`}>
-                                  <strong>{key}:</strong> {formatTraceValue(value)}
-                                </li>
-                              ))}
-                          </ul>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-            <div className="engine-panel">
-              <div className="engine-panel-header">
-                <h3>Sources</h3>
-                {selectedRun?.score !== undefined ? (
-                  <span className="engine-tag">Score {selectedRun.score.toFixed(2)}</span>
-                ) : null}
-              </div>
-              <div className="engine-panel-body">
-                {retrievedItems.length ? (
-                  <div className="engine-source-list">
-                    {retrievedItems.map((item, index) => (
-                      <div key={`${item.source || 'source'}-${index}`} className="engine-source-item">
-                        <p className="engine-source-text">{item.text}</p>
-                        <div className="engine-source-meta">
-                          <span>{item.source || 'Unknown source'}</span>
-                          <span>Page {item.page ?? '-'}</span>
-                          {typeof item.distance === 'number' ? (
-                            <span>Distance {item.distance.toFixed(2)}</span>
-                          ) : null}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="engine-empty">
-                    <p>Retrieved chunks will show up here after a query.</p>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-        </section>
-
         <aside className="engine-knowledge-panel">
           <div className="engine-panel">
             <div className="engine-panel-header">
+              <h3>Query Settings</h3>
+            </div>
+            <div className="engine-panel-body">
+              <label className="engine-field">
+                Mode
+                <select value={mode} onChange={(event) => setMode(event.target.value as typeof mode)}>
+                  <option value="agentic">Agentic</option>
+                  <option value="naive">Naive</option>
+                  <option value="retrieval_only">Retrieval only</option>
+                </select>
+              </label>
+              <label className="engine-field">
+                Top K
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={topK}
+                  onChange={(event) => setTopK(Number(event.target.value))}
+                />
+              </label>
+              {mode === 'agentic' ? (
+                <>
+                  <label className="engine-field">
+                    Min Score Target
+                    <input
+                      type="number"
+                      step={0.05}
+                      min={0}
+                      max={1}
+                      value={minScore}
+                      onChange={(event) => setMinScore(Number(event.target.value))}
+                    />
+                  </label>
+                  <label className="engine-field">
+                    Max Retries
+                    <input
+                      type="number"
+                      min={1}
+                      max={6}
+                      value={maxAttempts}
+                      onChange={(event) => setMaxAttempts(Number(event.target.value))}
+                    />
+                  </label>
+                </>
+              ) : null}
+            </div>
+          </div>
+          <div className="engine-panel">
+            <div className="engine-panel-header">
               <h3>Index Status</h3>
-              <span className={indexStatus?.ready ? 'engine-pill ready' : 'engine-pill pending'}>
-                {indexStatus?.ready ? 'Ready' : 'Needs build'}
+              <span
+                className={
+                  indexUiState === 'ready'
+                    ? 'engine-pill ready'
+                    : indexUiState === 'stale'
+                      ? 'engine-pill stale'
+                      : 'engine-pill pending'
+                }
+              >
+                {indexPanelLabel}
               </span>
             </div>
             <div className="engine-panel-body">
@@ -835,25 +874,39 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
                 <span>Chunks</span>
                 <strong>{indexStatus?.info?.chunks ?? '-'}</strong>
               </div>
+              <div className="engine-kv">
+                <span>Chunking mode</span>
+                <strong>{chunkingMode}</strong>
+              </div>
+              <div className="engine-kv">
+                <span>Embed batch size</span>
+                <strong>{activeEmbedBatchSize ?? '-'}</strong>
+              </div>
+              <div className="engine-kv">
+                <span>Hardware config updated</span>
+                <strong>{formatMtime(hardwareConfigMtime)}</strong>
+              </div>
               {indexStatus?.info?.last_error ? (
                 <p className="error-banner">{indexStatus.info.last_error}</p>
               ) : null}
               <div className="engine-divider" />
-              <label className="engine-switch">
+              <label className="engine-toggle">
                 <input
                   type="checkbox"
                   checked={autoRebuild}
                   onChange={(event) => setAutoRebuild(event.target.checked)}
                 />
-                Auto rebuild after changes
+                <span className="slider"></span>
+                <span className="label-text">Auto rebuild after changes</span>
               </label>
-              <label className="engine-switch">
+              <label className="engine-toggle">
                 <input
                   type="checkbox"
                   checked={rebuildFromScratch}
                   onChange={(event) => setRebuildFromScratch(event.target.checked)}
                 />
-                Rebuild from scratch
+                <span className="slider"></span>
+                <span className="label-text">Rebuild from scratch</span>
               </label>
               <label className="engine-field">
                 Max pages
@@ -869,6 +922,103 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
                 {isIndexing ? 'Indexing...' : 'Build index'}
               </Button>
               {indexError ? <p className="error-banner">{indexError}</p> : null}
+            </div>
+          </div>
+
+          <div className="engine-panel">
+            <div className="engine-panel-header">
+              <h3>Hardware Calibration</h3>
+              <span className="engine-pill">Optional</span>
+            </div>
+            <div className="engine-panel-body">
+              <p className="engine-hardware-note">
+                Run the hardware test manually to tune embedding throughput. This does not start indexing.
+              </p>
+              <label className="engine-toggle">
+                <input
+                  type="checkbox"
+                  checked={runHardwareTest}
+                  onChange={(event) => setRunHardwareTest(event.target.checked)}
+                />
+                <span className="slider"></span>
+                <span className="label-text">Run hardware calibration before indexing</span>
+              </label>
+              <label className="engine-toggle">
+                <input
+                  type="checkbox"
+                  checked={saveHardwareConfig}
+                  onChange={(event) => setSaveHardwareConfig(event.target.checked)}
+                />
+                <span className="slider"></span>
+                <span className="label-text">Save calibration result</span>
+              </label>
+              <label className="engine-toggle">
+                <input
+                  type="checkbox"
+                  checked={hardwareQuickTest}
+                  onChange={(event) => setHardwareQuickTest(event.target.checked)}
+                />
+                <span className="slider"></span>
+                <span className="label-text">Quick test mode</span>
+              </label>
+              <Button
+                className={`engine-calibrate-button ${isCalibrating ? 'is-running' : ''}`}
+                onClick={handleCalibrateNow}
+                disabled={isCalibrating || isIndexing}
+              >
+                <span className="engine-calibrate-label">
+                  {isCalibrating ? <span className="engine-inline-loader" aria-hidden="true" /> : null}
+                  <span>{isCalibrating ? 'Running hardware test...' : 'Run hardware test'}</span>
+                </span>
+              </Button>
+              <div className="engine-divider" />
+              <div className="engine-kv">
+                <span>Config path</span>
+                <strong className="engine-mono">{hardwareConfig?.config_path || '-'}</strong>
+              </div>
+              {calibrationSummary ? (
+                <>
+                  <div className="engine-kv">
+                    <span>Calibrated batch</span>
+                    <strong>{calibrationSummary.optimal_batch_size ?? '-'}</strong>
+                  </div>
+                  <div className="engine-kv">
+                    <span>Throughput</span>
+                    <strong>
+                      {typeof calibrationSummary.throughput_measured === 'number'
+                        ? calibrationSummary.throughput_measured.toFixed(2)
+                        : '-'}
+                    </strong>
+                  </div>
+                  <div className="engine-kv">
+                    <span>Calibration date</span>
+                    <strong>{formatDate(calibrationSummary.calibration_date)}</strong>
+                  </div>
+                  {calibrationSummary.tested_batch_sizes?.length ? (
+                    <div className="engine-kv">
+                      <span>Tested batches</span>
+                      <strong className="engine-mono">
+                        {calibrationSummary.tested_batch_sizes.join(', ')}
+                      </strong>
+                    </div>
+                  ) : null}
+                  {calibrationSummary.stop_reason ? (
+                    <div className="engine-kv">
+                      <span>Stop reason</span>
+                      <strong className="engine-mono">{calibrationSummary.stop_reason}</strong>
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <p className="engine-hardware-note">No calibration data available yet.</p>
+              )}
+              {calibrationSummary?.cpu_info ? (
+                <div className="engine-kv">
+                  <span>CPU profile</span>
+                  <strong className="engine-mono">{calibrationSummary.cpu_info}</strong>
+                </div>
+              ) : null}
+              {hardwareError ? <p className="error-banner">{hardwareError}</p> : null}
             </div>
           </div>
 
@@ -928,6 +1078,182 @@ const EngineWorkspace = ({ onBack }: EngineWorkspaceProps) => {
             </div>
           </div>
         </aside>
+
+        <section className="engine-chat-panel">
+          <div className="engine-chat-header">
+            <div>
+              <h2>Agent Chat</h2>
+              <p>
+                {streamState === 'starting'
+                  ? 'Connecting to the engine...'
+                  : 'Ask a question and watch the agent pipeline run.'}
+              </p>
+            </div>
+            <div className="engine-chat-status">
+              <span className="engine-live">Live</span>
+              <span className="engine-stream">{isQuerying ? 'Streaming' : 'Idle'}</span>
+            </div>
+          </div>
+
+          <div className="engine-message-list">
+            {messages.length ? (
+              messages.map((message) => (
+                <button
+                  key={message.id}
+                  type="button"
+                  className={`engine-message ${message.role} ${
+                    message.id === selectedRunId ? 'selected' : ''
+                  }`}
+                  onClick={() => {
+                    if (message.role === 'assistant') {
+                      setSelectedRunId(message.id);
+                    }
+                  }}
+                >
+                  <div className="engine-message-bubble">
+                    {message.role === 'assistant' ? (
+                      <>
+                        <div className="engine-message-meta">
+                          <span className="engine-role">Agent</span>
+                          {message.status === 'streaming' ? (
+                            <span className="engine-tag">Thinking...</span>
+                          ) : null}
+                          {message.modelUsed ? (
+                            <span className="engine-tag">Model: {message.modelUsed}</span>
+                          ) : null}
+                          {message.models
+                            ? Object.entries(message.models).map(([key, value]) => (
+                                <span key={`${message.id}-${key}`} className="engine-tag">
+                                  {key}: {value}
+                                </span>
+                              ))
+                            : null}
+                        </div>
+
+                        {message.status === 'streaming' || message.trace?.length ? (
+                          <div className="agent-progress-bar">
+                            {AGENT_STEPS.map((step, idx) => {
+                              const stepIndex = getActiveStepIndex(message);
+                              const isActive = idx === stepIndex && message.status === 'streaming';
+                              const isCompleted = idx < stepIndex || message.status === 'done';
+                              return (
+                                <div key={step.key} className={`agent-step ${isActive ? 'active' : ''} ${isCompleted ? 'completed' : ''}`}>
+                                  <div className="step-indicator">
+                                    {isCompleted ? '✓' : (isActive ? <span className="step-spinner" /> : idx + 1)}
+                                  </div>
+                                  <span className="step-label">{step.label}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : null}
+
+                        {message.attempts && message.attempts > 1 ? (
+                          <div className="agent-retry-alert">
+                            <span className="retry-icon">⚠️</span>
+                            <span>Score low ({message.score ? message.score.toFixed(2) : '?'}), refining strategy and retrying... Attempt {message.attempts}</span>
+                          </div>
+                        ) : null}
+
+                        {message.content ? (
+                          <ReactMarkdown>{message.content}</ReactMarkdown>
+                        ) : (
+                          <p className="engine-placeholder">Agent is gathering context...</p>
+                        )}
+                        {message.trace && message.trace.length > 0 ? (
+                          <details className="terminal-trace">
+                            <summary>
+                              <span className="trace-icon">⚡</span> Agent Terminal Trace
+                            </summary>
+                            <div className="terminal-trace-content">
+                              {message.trace.map((trace, index) => (
+                                <div key={`${trace.agent}-${index}`} className="terminal-trace-item">
+                                  <div className="terminal-trace-header">
+                                    <span className="terminal-trace-agent">[{trace.agent}]</span>
+                                    <span className="terminal-trace-message">{trace.message}</span>
+                                  </div>
+                                  {trace.data && (
+                                    <pre className="terminal-trace-data">
+                                      {JSON.stringify(trace.data, null, 2)}
+                                    </pre>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                        ) : null}
+                        {message.retrieved && message.retrieved.length > 0 ? (
+                          <div className="inline-sources">
+                            <details>
+                              <summary>
+                                <span className="source-icon">📚</span> Sources ({message.retrieved.length})
+                              </summary>
+                              <div className="inline-sources-content">
+                                {message.retrieved.map((item, index) => (
+                                  <div key={`${item.source || 'source'}-${index}`} className="inline-source-item">
+                                    <p className="inline-source-text">"{item.text}"</p>
+                                    <div className="inline-source-meta">
+                                      <span>{item.source || 'Unknown source'}</span>
+                                      <span>Page {item.page ?? '-'}</span>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </details>
+                          </div>
+                        ) : null}
+                      </>
+                    ) : (
+                      <p>{message.content}</p>
+                    )}
+                  </div>
+                </button>
+              ))
+            ) : (
+              <div className="engine-empty">
+                <p>No chats yet. Ask your first question to get started.</p>
+              </div>
+            )}
+            {isQuerying ? (
+              <div className="engine-message assistant">
+                <div className="engine-message-bubble">
+                  <div className="typing-indicator">
+                    <span>Agent is thinking</span>
+                    <span className="typing-dot" />
+                    <span className="typing-dot" />
+                    <span className="typing-dot" />
+                  </div>
+                </div>
+              </div>
+            ) : null}
+            <div ref={endRef} />
+          </div>
+
+          <div className="engine-composer">
+            {needsReindex ? (
+              <div className="engine-alert">
+                {localPendingReindex
+                  ? 'New document changes are not indexed yet. '
+                  : 'Index needs rebuilding before you can query. '}{' '}
+                <button type="button" onClick={handleIndex} disabled={isIndexing}>
+                  {isIndexing ? 'Rebuilding...' : 'Rebuild now'}
+                </button>
+              </div>
+            ) : null}
+            <textarea
+              className="engine-textarea"
+              placeholder="Ask about your PDFs, policies, or notes..."
+              value={question}
+              onChange={(event) => setQuestion(event.target.value)}
+            />
+            <div className="engine-composer-row">
+              <Button className="engine-send-button" onClick={handleQuery} disabled={!canSend}>
+                {isQuerying ? 'Running...' : 'Send Query'}
+              </Button>
+            </div>
+            {queryError ? <p className="error-banner">{queryError}</p> : null}
+          </div>
+        </section>
       </div>
     </div>
   );

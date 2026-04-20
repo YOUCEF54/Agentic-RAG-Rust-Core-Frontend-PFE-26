@@ -1,0 +1,103 @@
+﻿Frontend Integration Prompt: API v2 Migration (Markdown Chunking + Optional Hardware Calibration)
+
+Context
+- The backend indexing pipeline now matches `script_opt_v2.py` behavior.
+- Indexing uses markdown extraction per PDF page (`pdf_oxide`) and heading-aware semantic chunking.
+- Hardware calibration is now available and optional.
+
+Main API Contract Changes
+1. `POST /index` request body has optional hardware fields:
+   - `run_hardware_test` (boolean, default `false`)
+   - `save_hardware_config` (boolean, default `true`)
+   - `hardware_quick_test` (boolean, default `true`)
+   - `hardware_max_runtime_seconds` (number, default `25.0`)
+
+2. `POST /index` response includes additional fields:
+   - `chunking` (string): currently `"markdown_semantic_v2"`
+   - `embed_batch_size` (number): active embedding batch size used during indexing
+   - `hardware_calibration` (object, optional): present only when `run_hardware_test=true`
+
+3. `GET /index/status` now returns extended `info` with:
+   - `chunking`
+   - `embed_batch_size`
+   - `hardware_config_mtime`
+
+4. `GET /health` now includes:
+   - `chunking`
+   - `embed_batch_size`
+   - `hardware_config_mtime`
+
+New Hardware Endpoints
+1. `GET /hardware/config`
+   - Returns stored hardware config (if available), active batch size, and config path.
+
+2. `POST /hardware/calibrate`
+   - Optional body: `{ "save_config": true, "quick_mode": true, "max_runtime_seconds": 25.0 }`
+   - Runs calibration benchmark and updates active embedding batch size.
+   - Calibration now stops early if throughput drops versus the best tested batch size.
+
+What Did NOT Change
+- Query endpoints remain the same:
+  - `POST /query`
+  - `POST /query/stream`
+- Retrieved items still use source/page metadata in `retrieved`.
+- Agentic and naive query modes are unchanged from frontend perspective.
+
+Frontend Action Items
+1. Update index request type:
+   - Add optional `run_hardware_test?: boolean`
+   - Add optional `save_hardware_config?: boolean`
+   - Add optional `hardware_quick_test?: boolean`
+   - Add optional `hardware_max_runtime_seconds?: number`
+
+2. Update index response type:
+   - Add `chunking?: string`
+   - Add `embed_batch_size?: number`
+   - Add `hardware_config_mtime?: number | null`
+   - Add optional `hardware_calibration?: { optimal_batch_size: number; throughput_measured: number; calibration_date: string; cpu_info: string }`
+
+3. Add hardware settings UI (optional but recommended):
+   - Toggle: "Run hardware calibration before indexing"
+   - Toggle: "Save calibration result"
+   - Button: "Run calibration now" calling `POST /hardware/calibrate`
+   - Read-only view for `GET /hardware/config`
+
+4. Show indexing diagnostics in UI:
+   - Display `chunking` mode and `embed_batch_size` after index build
+   - If `hardware_calibration` exists, show summary (batch size + throughput)
+   - Show optional calibration diagnostics: `tested_batch_sizes` and `stop_reason`
+
+Suggested Frontend Payload Examples
+- Build index without calibration:
+  {
+    "rebuild": true,
+    "max_pages": null,
+    "run_hardware_test": false,
+    "save_hardware_config": true,
+    "hardware_quick_test": true,
+    "hardware_max_runtime_seconds": 25.0
+  }
+
+- Build index with calibration:
+  {
+    "rebuild": true,
+    "max_pages": null,
+    "run_hardware_test": true,
+    "save_hardware_config": true,
+    "hardware_quick_test": true,
+    "hardware_max_runtime_seconds": 25.0
+  }
+
+- Calibrate only:
+  POST /hardware/calibrate
+  {
+    "save_config": true,
+    "quick_mode": true,
+    "max_runtime_seconds": 25.0
+  }
+
+Notes for QA
+- Validate that indexing still works when calibration is disabled (default path).
+- Validate that `/index` with `run_hardware_test=true` returns `hardware_calibration` in response.
+- Validate that `/hardware/config` reflects saved config and active batch size.
+- Validate retrieval and streamed query flows are unaffected.
